@@ -1,21 +1,23 @@
-//! By convention, main.zig is where your main function lives in the case that
-//! you are building an executable. If you are making a library, the convention
-//! is to delete this file and start with root.zig instead.
+const std = @import("std");
+
+const stdin_file = std.io.getStdIn().reader();
+var br = std.io.bufferedReader(stdin_file);
+const stdin = br.reader();
+
+fn read() ?u8 {
+    return stdin.readByte() catch return null;
+}
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    var term = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+    term.lflag.ECHO = false;
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    try std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, term);
+    while (read()) |byte| {
+        if (byte == 'q') break;
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
-
-    try bw.flush(); // Don't forget to flush!
+        std.debug.print("Read byte: {}, \\0b{b}\n", .{ byte, byte });
+    }
 }
 
 test "simple test" {
@@ -34,5 +36,3 @@ test "fuzz example" {
     };
     try std.testing.fuzz(global.testOne, .{});
 }
-
-const std = @import("std");
