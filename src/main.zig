@@ -14,6 +14,11 @@ const Config = struct {
     screen_rows: u16 = 0,
     screen_cols: u16 = 0,
     cursor: Cursor = .{ .row = 0, .col = 0 },
+    row: std.ArrayList(Row) = undefined,
+
+    fn create(rows: u16, cols: u16) !Config {
+        return .{ .screen_rows = rows, .screen_cols = cols, .row = std.ArrayList(Row).init(std.heap.page_allocator) };
+    }
 };
 
 const Cursor = struct {
@@ -22,8 +27,9 @@ const Cursor = struct {
 };
 
 const Buffer = std.ArrayList(u8);
+const Row = Buffer;
 
-var editor: Config = .{};
+var editor: Config = undefined;
 
 fn read() ?u8 {
     return stdin.readByte() catch return null;
@@ -71,13 +77,12 @@ fn move_cursor(cursor: *Cursor, by: struct { x: i16, y: i16 }) void {
 
 fn init() !void {
     var term = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
-    editor.original_terminal = term;
 
     var winsize: std.posix.winsize = undefined;
     _ = std.posix.system.ioctl(std.posix.STDIN_FILENO, std.posix.system.T.IOCGWINSZ, @intFromPtr(&winsize));
 
-    editor.screen_rows = winsize.row;
-    editor.screen_cols = winsize.col;
+    editor = try Config.create(winsize.row, winsize.col);
+    editor.original_terminal = term;
 
     try setup_terminal(&term);
 
@@ -202,23 +207,40 @@ const ConsoleCommand = enum {
     }
 };
 
+fn clear_screen(buffer: *Buffer) !void {
+    try buffer.writer().print("{s}", .{ConsoleCommand.clear_screen});
+}
+
+fn clear_line(buffer: *Buffer) !void {
+    try buffer.writer().print("{s}", .{ConsoleCommand.clear_line});
+}
+
 fn draw(buf: *Buffer) !void {
-    for (0..editor.screen_rows - 1) |y| {
-        try buf.writer().print("{s}", .{ConsoleCommand.clear_line});
-        if (y == editor.screen_rows / 3) {
-            const message: []const u8 = "zorro editor -- version: 0.0.1";
-            try buf.writer().print("{s: ^[1]}", .{ message, editor.screen_cols });
-        } else {
-            try buf.writer().writeAll("~\r\n");
+    if (editor.row.items.len == 0) {
+        for (0..editor.screen_rows - 1) |y| {
+            try clear_line(buf);
+            if (y == editor.screen_rows / 3) {
+                const message: []const u8 = "zorro editor -- version: 0.0.1";
+                try buf.writer().print("{s: ^[1]}", .{ message, editor.screen_cols });
+            } else {
+                try buf.writer().writeAll("~\r\n");
+            }
+        }
+        try buf.writer().writeAll("~");
+    } else {
+        for (editor.row.items, 0..) |row, y| {
+            if (y == editor.screen_rows - 1) break;
+            try clear_line(buf);
+            try buf.writer().writeAll(row.items);
         }
     }
-    try buf.writer().writeAll("~");
 }
 
 fn refresh_screen() !void {
     var buffer = Buffer.init(std.heap.page_allocator);
     try buffer.writer().print("{s}", .{ConsoleCommand.hide_cursor});
-    try buffer.writer().print("{s}", .{ConsoleCommand.clear_screen});
+    try buffer.writer().print("{s}", .{ConsoleCommand.reset_cursor});
+    try clear_screen(&buffer);
     try draw(&buffer);
     try buffer.writer().print("\x1b[{d};{d}H", .{ editor.cursor.row + 1, editor.cursor.col + 1 });
     try buffer.writer().print("{s}", .{ConsoleCommand.show_cursor});
@@ -227,10 +249,30 @@ fn refresh_screen() !void {
     buffer.clearAndFree();
 }
 
+fn open(name: [:0]const u8) !void {
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const slice = try std.fs.realpath(name, &path);
+    const file = try std.fs.openFileAbsolute(slice, .{ .mode = .read_only });
+    defer file.close();
+
+    while (try file.reader().readUntilDelimiterOrEofAlloc(std.heap.page_allocator, '\n', 4096)) |line| {
+        var row = Row.init(std.heap.page_allocator);
+        try row.writer().writeAll(line);
+        try row.writer().writeAll("\r\n");
+        try editor.row.append(row);
+    }
+}
+
 pub fn main() !void {
     try init();
     defer cleanup();
     errdefer error_cleanup();
+
+    if (std.os.argv.len > 1) {
+        const args = try std.process.argsAlloc(std.heap.page_allocator);
+        try open(args[1]);
+    }
+
     while (true) {
         try refresh_screen();
         if (!process_keypress()) break;
