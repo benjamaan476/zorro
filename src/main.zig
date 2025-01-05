@@ -9,44 +9,21 @@ const stdin = in_br.reader();
 var out_bw = std.io.bufferedWriter(stdout_file);
 const stdout = out_bw.writer();
 
-const config = struct {
+const Config = struct {
     original_terminal: std.posix.termios = undefined,
     screen_rows: u16 = 0,
     screen_cols: u16 = 0,
+    cursor: Cursor = .{ .row = 0, .col = 0 },
 };
 
-const cursor = struct {
+const Cursor = struct {
     row: u16,
     col: u16,
 };
 
-const buffer = struct {
-    buf: []u8 = undefined,
-    allocator: std.mem.Allocator,
+const Buffer = std.ArrayList(u8);
 
-    fn init(self: *buffer, allocator: std.mem.Allocator) !void {
-        self.allocator = allocator;
-        self.buf = try self.allocator.alloc(u8, 16);
-    }
-
-    fn append(self: *buffer, app: []const u8) !void {
-        const old_len = self.buf.len;
-        const new = try self.allocator.realloc(self.buf, old_len + app.len);
-        std.mem.copyForwards(u8, new[old_len..], app);
-
-        self.buf = new;
-    }
-
-    fn print(self: buffer) void {
-            std.debug.print("{s}", .{self.buf});
-    }
-
-    fn free(self: *buffer) void {
-        self.allocator.free(self.buf);
-    }
-};
-
-var editor: config = .{};
+var editor: Config = .{};
 
 fn read() ?u8 {
     return stdin.readByte() catch return null;
@@ -87,19 +64,12 @@ fn setup_terminal(terminal: *std.posix.termios) !void {
     terminal.cc[@intFromEnum(std.posix.V.TIME)] = 1;
 }
 
-fn get_cursor() !cursor {
-    try write("\x1b[6n");
-    var buf: [32] u8 = undefined;
-    const slice = try stdin.readUntilDelimiter(&buf, 'R');
-
-    var splitter = std.mem.tokenizeScalar(u8, slice[2..], ';');
-    const row = try std.fmt.parseInt(u16, splitter.next().?, 10);
-    const col = try std.fmt.parseInt(u16, splitter.next().?, 10);
-    return .{.row = row, .col = col};
+fn move_cursor(cursor: *Cursor, by: struct { x: i16, y: i16 }) void {
+    cursor.col = @intCast(std.math.clamp(@as(i16, @intCast(cursor.col)) + by.x, 0, @as(i16, @intCast(editor.screen_cols - 1))));
+    cursor.row = @intCast(std.math.clamp(@as(i16, @intCast(cursor.row)) + by.y, 0, @as(i16, @intCast(editor.screen_rows - 1))));
 }
 
 fn init() !void {
-    
     var term = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
     editor.original_terminal = term;
 
@@ -110,55 +80,159 @@ fn init() !void {
     editor.screen_cols = winsize.col;
 
     try setup_terminal(&term);
-    
+
     try std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, term);
 }
 
+const Key = enum {
+    Left,
+    Right,
+    Up,
+    Down,
+    Del,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Exit,
+};
 
-fn process_keypress() bool {
-    const byte = while(true) {
+const Character = union(enum) {
+    key: Key,
+    char: u8,
+};
+
+fn read_key() Character {
+    const byte = while (true) {
         const c = read();
 
-        if(c != null) break c.?;
+        if (c != null) break c.?;
     } else '0';
 
     switch (byte) {
-        ctrl('q') => return false,
-        else => {
-            if(std.ascii.isControl(byte)) {
-                write("blah\r\n") catch return false;
-            } else {
-                write("chkl") catch return false;
-                std.debug.print("H\r\n", .{});
+        '\x1b' => {
+            var seq: [3]u8 = undefined;
+            seq[0] = read().?;
+            seq[1] = read().?;
+            if (seq[0] == '[') {
+                if (seq[1] >= '0' and seq[1] <= '9') {
+                    seq[2] = read().?;
+                    if (seq[2] == '~') {
+                        switch (seq[1]) {
+                            '1', '7' => return .{ .key = Key.Home },
+                            '4', '8' => return .{ .key = Key.End },
+                            '5' => return .{ .key = Key.PageUp },
+                            '6' => return .{ .key = Key.PageDown },
+                            else => {},
+                        }
+                    }
+                } else {
+                    switch (seq[1]) {
+                        'A' => return .{ .key = Key.Up },
+                        'B' => return .{ .key = Key.Down },
+                        'C' => return .{ .key = Key.Right },
+                        'D' => return .{ .key = Key.Left },
+                        else => {},
+                    }
+                }
+            } else if (seq[0] == 'O') {
+                switch (seq[1]) {
+                    'H' => return .{ .key = Key.Home },
+                    'F' => return .{ .key = Key.End },
+                    else => {},
+                }
+            }
+        },
+        else => {},
+    }
+    return .{ .char = byte };
+}
+
+fn process_keypress() bool {
+    const char = read_key();
+    switch (char) {
+        .key => |*key| {
+            switch (key.*) {
+                .Left => move_cursor(&editor.cursor, .{ .x = -1, .y = 0 }),
+                .Right => move_cursor(&editor.cursor, .{ .x = 1, .y = 0 }),
+                .Up => move_cursor(&editor.cursor, .{ .x = 0, .y = -1 }),
+                .Down => move_cursor(&editor.cursor, .{ .x = 0, .y = 1 }),
+                .Home => move_cursor(&editor.cursor, .{ .x = -@as(i16, @intCast(editor.screen_cols)), .y = 0 }),
+                .End => move_cursor(&editor.cursor, .{ .x = @as(i16, @intCast(editor.screen_cols)), .y = 0 }),
+                .PageUp => move_cursor(&editor.cursor, .{ .x = 0, .y = -@as(i16, @intCast(editor.screen_rows)) }),
+                .PageDown => move_cursor(&editor.cursor, .{ .x = 0, .y = @intCast(editor.screen_rows) }),
+                .Del => {},
+                .Exit => return false,
+            }
+        },
+        .char => |c| {
+            switch (c) {
+                ctrl('q') => return false,
+                's', 'j' => move_cursor(&editor.cursor, .{ .x = 0, .y = 1 }),
+                'w', 'k' => move_cursor(&editor.cursor, .{ .x = 0, .y = -1 }),
+                'a', 'h' => move_cursor(&editor.cursor, .{ .x = -1, .y = 0 }),
+                'd', 'l' => move_cursor(&editor.cursor, .{ .x = 1, .y = 0 }),
+                else => {},
             }
         },
     }
     return true;
 }
 
-fn draw() !void {
-    for(0..editor.screen_cols - 1) |_| {
-        try write("~\r\n");
+const ConsoleCommand = enum {
+    clear_screen,
+    clear_line,
+    reset_cursor,
+    hide_cursor,
+    show_cursor,
+
+    pub fn format(self: ConsoleCommand, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+
+        const out = switch (self) {
+            .clear_screen => "\x1b[2J",
+            .clear_line => "\x1b[K",
+            .reset_cursor => "\x1b[H",
+            .hide_cursor => "\x1b[?25l",
+            .show_cursor => "\x1b[?25h",
+        };
+
+        try writer.print("{s}", .{out});
     }
-    try write("~");
+};
+
+fn draw(buf: *Buffer) !void {
+    for (0..editor.screen_rows - 1) |y| {
+        try buf.writer().print("{s}", .{ConsoleCommand.clear_line});
+        if (y == editor.screen_rows / 3) {
+            const message: []const u8 = "zorro editor -- version: 0.0.1";
+            try buf.writer().print("{s: ^[1]}", .{ message, editor.screen_cols });
+        } else {
+            try buf.writer().writeAll("~\r\n");
+        }
+    }
+    try buf.writer().writeAll("~");
 }
 
 fn refresh_screen() !void {
-    _ = try write("\x1b[2J");
-    _ = try write("\x1b[H");
+    var buffer = Buffer.init(std.heap.page_allocator);
+    try buffer.writer().print("{s}", .{ConsoleCommand.hide_cursor});
+    try buffer.writer().print("{s}", .{ConsoleCommand.clear_screen});
+    try draw(&buffer);
+    try buffer.writer().print("\x1b[{d};{d}H", .{ editor.cursor.row + 1, editor.cursor.col + 1 });
+    try buffer.writer().print("{s}", .{ConsoleCommand.show_cursor});
 
-    try draw();
-
-    _ = try write("\x1b[H");
+    try write(buffer.items);
+    buffer.clearAndFree();
 }
 
 pub fn main() !void {
-
     try init();
     defer cleanup();
     errdefer error_cleanup();
     while (true) {
         try refresh_screen();
-        if(!process_keypress()) break;
+        if (!process_keypress()) break;
     }
 }
